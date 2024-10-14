@@ -155,6 +155,7 @@ class Boxes:
                 tensor = tensor.to(torch.float32)
                 # If some use case still fails with 'cannot mutate tensors with frozen storage'
                 # we can add `tensor = tensor.clone()` here.
+                tensor = tensor.clone() # Adding this line anyway to support amp
                 # Reference: https://github.com/pytorch/pytorch/issues/127571
         if tensor.numel() == 0:
             # Use reshape, so we don't end up creating a new tensor that does not depend on
