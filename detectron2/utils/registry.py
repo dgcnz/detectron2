@@ -1,7 +1,9 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 
-from typing import Any
 import pydoc
+from typing import Any
+
+from detectron2.layers.wrappers import check_if_dynamo_compiling
 from fvcore.common.registry import Registry  # for backward compatibility.
 
 """
@@ -20,6 +22,10 @@ def _convert_target_to_string(t: Any) -> str:
         t: any object with ``__module__`` and ``__qualname__``
     """
     module, qualname = t.__module__, t.__qualname__
+
+    # TorchDynamo doesn't support `locate`
+    if check_if_dynamo_compiling():
+        return f"{module}.{qualname}"
 
     # Compress the path to this object, e.g. ``module.submodule._impl.class``
     # may become ``module.submodule.class``, if the later also resolves to the same
