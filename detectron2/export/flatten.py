@@ -1,12 +1,14 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import collections
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
-import torch
-from torch import nn
 
+import torch
+from detectron2.layers.wrappers import check_if_dynamo_compiling
 from detectron2.structures import Boxes, Instances, ROIMasks
 from detectron2.utils.registry import _convert_target_to_string, locate
+from torch import nn
 
 from .torchscript_patch import patch_builtin_len
 
@@ -228,6 +230,7 @@ class TracingAdapter(nn.Module):
         inputs,
         inference_func: Optional[Callable] = None,
         allow_non_tensor: bool = False,
+        specialize_non_tensor: bool = False,
     ):
         """
         Args:
@@ -245,6 +248,8 @@ class TracingAdapter(nn.Module):
                 This is useful when you're only interested in the single trace of
                 execution (e.g. for flop count), but not interested in
                 generalizing the traced graph to new inputs.
+            specialize_non_tensor: non-tensor inputs will be specialized and kept as
+                model constants. ``self.flattened_inputs`` will only contain tensors.
         """
         super().__init__()
         if isinstance(model, (nn.parallel.distributed.DistributedDataParallel, nn.DataParallel)):
@@ -254,13 +259,20 @@ class TracingAdapter(nn.Module):
             inputs = (inputs,)
         self.inputs = inputs
         self.allow_non_tensor = allow_non_tensor
+        self.specialize_non_tensor = specialize_non_tensor
 
         if inference_func is None:
             inference_func = lambda model, *inputs: model(*inputs)  # noqa
         self.inference_func = inference_func
-
         self.flattened_inputs, self.inputs_schema = flatten_to_tuple(inputs)
-
+        self.flattened_inputs = tuple(
+            [
+                x.contiguous() if isinstance(x, torch.Tensor) else x
+                for x in self.flattened_inputs
+            ]
+        )
+        self.specialized_values = []
+        self.is_specialized = [False] * len(self.flattened_inputs)
         if all(isinstance(x, torch.Tensor) for x in self.flattened_inputs):
             return
         if self.allow_non_tensor:
@@ -269,16 +281,59 @@ class TracingAdapter(nn.Module):
             )
             self.inputs_schema = None
         else:
+            default_specializable_types = (int, float, bool, str)
             for input in self.flattened_inputs:
-                if not isinstance(input, torch.Tensor):
+                if not isinstance(input, torch.Tensor) and not (
+                    specialize_non_tensor
+                    and isinstance(input, default_specializable_types)
+                ):
                     raise ValueError(
                         "Inputs for tracing must only contain tensors. "
                         f"Got a {type(input)} instead."
                     )
+            # specialize non-tensor inputs
+            if specialize_non_tensor:
+                self.is_specialized: list[bool] = [
+                    isinstance(x, default_specializable_types)
+                    for x in self.flattened_inputs
+                ]
+                self.specialized_values = tuple(
+                    [
+                        x
+                        for ix, x in enumerate(self.flattened_inputs)
+                        if self.is_specialized[ix]
+                    ]
+                )
+                self.flattened_inputs = tuple(
+                    [
+                        x
+                        for ix, x in enumerate(self.flattened_inputs)
+                        if not self.is_specialized[ix]
+                    ]
+                )
+
+    def _build_args_with_specialized(self, args: tuple) -> tuple:
+        """
+        Reconstruct original inputs by merging `flattened_args` with `specialized_values`.
+        """
+        ix, jx = 0, 0
+        new_args = []
+        assert len(args) == len(self.flattened_inputs)
+        for p in self.is_specialized:
+            if p:
+                new_args.append(self.specialized_values[jx])
+                jx += 1
+            else:
+                new_args.append(args[ix])
+                ix += 1
+        return tuple(new_args)
 
     def forward(self, *args: torch.Tensor):
-        with torch.no_grad(), patch_builtin_len():
+        ctx = patch_builtin_len if not check_if_dynamo_compiling() else nullcontext
+        with torch.no_grad(), ctx():
             if self.inputs_schema is not None:
+                if self.specialize_non_tensor and self.specialized_values:
+                    args = self._build_args_with_specialized(args)
                 inputs_orig_format = self.inputs_schema(args)
             else:
                 if len(args) != len(self.flattened_inputs) or any(
@@ -290,13 +345,17 @@ class TracingAdapter(nn.Module):
                         " traced with `.flattened_inputs`."
                     )
                 inputs_orig_format = self.inputs
-
             outputs = self.inference_func(self.model, *inputs_orig_format)
             flattened_outputs, schema = flatten_to_tuple(outputs)
 
             flattened_output_tensors = tuple(
                 [x for x in flattened_outputs if isinstance(x, torch.Tensor)]
             )
+            if check_if_dynamo_compiling():
+                # Compiled model should only contain computation, not schema parsing logic
+                torch._check(len(flattened_output_tensors) == len(flattened_outputs))
+                return flattened_outputs
+
             if len(flattened_output_tensors) < len(flattened_outputs):
                 if self.allow_non_tensor:
                     flattened_outputs = flattened_output_tensors
