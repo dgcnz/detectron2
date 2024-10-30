@@ -115,6 +115,9 @@ def _log_classification_stats(pred_logits, gt_classes, prefix="fast_rcnn"):
         storage.put_scalar(f"{prefix}/false_negative", num_false_negative / num_fg)
 
 
+SKIP_NMS = False
+SKIP_FILTER_CONFIDENCE = False
+
 def fast_rcnn_inference_single_image(
     boxes,
     scores,
@@ -135,7 +138,7 @@ def fast_rcnn_inference_single_image(
         Same as `fast_rcnn_inference`, but for only one image.
     """
     valid_mask = torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores).all(dim=1)
-    if not valid_mask.all():
+    if not torch._dynamo.is_compiling() and not valid_mask.all():
         boxes = boxes[valid_mask]
         scores = scores[valid_mask]
 
@@ -145,24 +148,34 @@ def fast_rcnn_inference_single_image(
     boxes = Boxes(boxes.reshape(-1, 4))
     boxes.clip(image_shape)
     boxes = boxes.tensor.view(-1, num_bbox_reg_classes, 4)  # R x C x 4
+    if torch._dynamo.is_compiling() and SKIP_FILTER_CONFIDENCE:
+        _, inds = torch.topk(scores.flatten(), topk_per_image)
+        filter_inds = torch.column_stack(torch.unravel_index(inds, scores.shape))
+        boxes = boxes[filter_inds[:, 0], filter_inds[:, 1]]
+        # scores = scores[filter_inds[:, 0], filter_inds[:, 1]]
+        filter_mask = torch.zeros_like(scores, dtype=torch.bool)
+        filter_mask[filter_inds[:, 0], filter_inds[:, 1]] = True
+    else:
+        # 1. Filter results based on detection scores. It can make NMS more efficient
+        #    by filtering out low-confidence detections.
+        filter_mask = scores > score_thresh  # R x K
+        # R' x 2. First column contains indices of the R predictions;
+        # Second column contains indices of classes.
+        filter_inds = filter_mask.nonzero()
 
-    # 1. Filter results based on detection scores. It can make NMS more efficient
-    #    by filtering out low-confidence detections.
-    filter_mask = scores > score_thresh  # R x K
-    # R' x 2. First column contains indices of the R predictions;
-    # Second column contains indices of classes.
-    filter_inds = filter_mask.nonzero()
     if num_bbox_reg_classes == 1:
         boxes = boxes[filter_inds[:, 0], 0]
     else:
         boxes = boxes[filter_mask]
     scores = scores[filter_mask]
+    assert boxes.shape[0] == scores.shape[0]
 
-    # 2. Apply NMS for each class independently.
-    keep = batched_nms(boxes, scores, filter_inds[:, 1], nms_thresh)
-    if topk_per_image >= 0:
-        keep = keep[:topk_per_image]
-    boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
+    if not (torch._dynamo.is_compiling() and SKIP_NMS):
+        # 2. Apply NMS for each class independently.
+        keep = batched_nms(boxes, scores, filter_inds[:, 1], nms_thresh)
+        if topk_per_image >= 0:
+            keep = keep[:topk_per_image]
+        boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
 
     result = Instances(image_shape)
     result.pred_boxes = Boxes(boxes)

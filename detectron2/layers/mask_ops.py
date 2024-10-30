@@ -4,6 +4,7 @@ from typing import Tuple
 import torch
 from PIL import Image
 from torch.nn import functional as F
+import math
 
 __all__ = ["paste_masks_in_image"]
 
@@ -35,7 +36,7 @@ def _do_paste_mask(masks, boxes, img_h: int, img_w: int, skip_empty: bool = True
     # this has more operations but is faster on COCO-scale dataset.
     device = masks.device
 
-    if skip_empty and not torch.jit.is_scripting():
+    if skip_empty and not torch.jit.is_scripting() and not torch._dynamo.is_compiling():
         x0_int, y0_int = torch.clamp(boxes.min(dim=0).values.floor()[:2] - 1, min=0).to(
             dtype=torch.int32
         )
@@ -120,7 +121,7 @@ def paste_masks_in_image(
     else:
         # GPU benefits from parallelism for larger chunks, but may have memory issue
         # int(img_h) because shape may be tensors in tracing
-        num_chunks = int(np.ceil(N * int(img_h) * int(img_w) * BYTES_PER_FLOAT / GPU_MEM_LIMIT))
+        num_chunks = int(math.ceil(N * int(img_h) * int(img_w) * BYTES_PER_FLOAT / GPU_MEM_LIMIT))
         assert (
             num_chunks <= N
         ), "Default GPU_MEM_LIMIT in mask_ops.py is too small; try increasing it"

@@ -36,6 +36,8 @@ def shapes_to_tensor(x: List[int], device: Optional[torch.device] = None) -> tor
         if ret.device != device:  # avoid recording a hard-coded device if not necessary
             ret = ret.to(device=device)
         return ret
+    if torch._dynamo.is_compiling():
+        return torch.tensor(x, device=device)
     return torch.as_tensor(x, device=device)
 
 

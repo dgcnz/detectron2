@@ -18,6 +18,7 @@ def _is_tracing():
     else:
         return torch.jit.is_tracing()
 
+SKIP_NMS = False
 
 def find_top_rpn_proposals(
     proposals: List[torch.Tensor],
@@ -101,6 +102,15 @@ def find_top_rpn_proposals(
         boxes = Boxes(topk_proposals[n])
         scores_per_img = topk_scores[n]
         lvl = level_ids
+
+        if torch._dynamo.is_compiling() and SKIP_NMS:
+            # DYNAMO: nms is intrinsically data dependent, must ignore
+            boxes.clip(image_size)
+            res = Instances(image_size)
+            res.proposal_boxes = boxes
+            res.objectness_logits = scores_per_img
+            results.append(res)
+            continue
 
         valid_mask = torch.isfinite(boxes.tensor).all(dim=1) & torch.isfinite(scores_per_img)
         if not valid_mask.all():
